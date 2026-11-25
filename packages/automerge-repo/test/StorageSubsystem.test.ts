@@ -563,16 +563,28 @@ class GatedStorageAdapter extends DummyStorageAdapter {
     remove?: Promise<void>
   } = {}
 
-  /** Number of remove() calls made, including any still held. */
-  removesStarted = 0
+  /** Hold only the removeRange() of this chunk type, if set. */
+  removeRangeType?: string
+
+  /** Resolves when a held removeRange() starts. */
+  removeRangeHeld = Promise.withResolvers<void>()
 
   async removeRange(keyPrefix: string[]): Promise<void> {
-    await this.gates.removeRange
+    if (
+      this.removeRangeType === undefined ||
+      keyPrefix[1] === this.removeRangeType
+    ) {
+      this.removeRangeHeld.resolve()
+      await this.gates.removeRange
+    }
     return super.removeRange(keyPrefix)
   }
 
+  /** Resolves when a remove() starts. */
+  removeStarted = Promise.withResolvers<void>()
+
   async remove(key: string[]): Promise<void> {
-    this.removesStarted++
+    this.removeStarted.resolve()
     await this.gates.remove
     return super.remove(key)
   }
@@ -585,12 +597,6 @@ class GatedStorageAdapter extends DummyStorageAdapter {
   }
 }
 
-const deferred = () => {
-  let release!: () => void
-  const promise = new Promise<void>(resolve => (release = resolve))
-  return { promise, release }
-}
-
 describe("StorageSubsystem removal in flight", () => {
   it("persists a document re-imported and saved while its removal is pending", async () => {
     const adapter = new GatedStorageAdapter()
@@ -599,14 +605,34 @@ describe("StorageSubsystem removal in flight", () => {
     const doc = A.from({ foo: "bar" })
     await storage.saveDoc(documentId, doc)
 
-    const gate = deferred()
+    const gate = Promise.withResolvers<void>()
     adapter.gates.removeRange = gate.promise
     const removal = storage.removeDoc(documentId)
     await storage.saveDoc(documentId, doc) // re-import, flushed mid-removal
-    gate.release()
+    gate.resolve()
     await removal
 
     await storage.saveDoc(documentId, doc)
+    const reloaded = await new StorageSubsystem(adapter).loadDoc(documentId)
+    assert.deepStrictEqual(reloaded, doc)
+  })
+
+  it("persists a re-import saved after the removal deleted the snapshots", async () => {
+    const adapter = new GatedStorageAdapter()
+    const storage = new StorageSubsystem(adapter)
+    const documentId = parseAutomergeUrl(generateAutomergeUrl()).documentId
+    const doc = A.from({ foo: "bar" })
+    await storage.saveDoc(documentId, doc)
+
+    const gate = Promise.withResolvers<void>()
+    adapter.gates.removeRange = gate.promise
+    adapter.removeRangeType = "incremental"
+    const removal = storage.removeDoc(documentId)
+    await adapter.removeRangeHeld.promise // the snapshots are gone
+    await storage.saveDoc(documentId, doc) // re-import
+    gate.resolve()
+    await removal
+
     const reloaded = await new StorageSubsystem(adapter).loadDoc(documentId)
     assert.deepStrictEqual(reloaded, doc)
   })
@@ -618,12 +644,17 @@ describe("StorageSubsystem removal in flight", () => {
     const doc = A.from({ foo: "bar" })
     await storage.saveDoc(documentId, doc)
 
-    const gate = deferred()
+    const gate = Promise.withResolvers<void>()
     adapter.gates.loadRange = gate.promise
     const load = storage.loadDoc(documentId) // has read, has not returned
     await storage.removeDoc(documentId)
-    gate.release()
+    gate.resolve()
     await load
+    assert.equal(
+      storage[kTrackedDocuments],
+      0,
+      "the late load tracks no chunks"
+    )
 
     adapter.gates.loadRange = undefined
     await storage.saveDoc(documentId, doc)
@@ -641,7 +672,7 @@ describe("StorageSubsystem removal in flight", () => {
     const d1 = A.from({ foo: "bar" })
     await storage.saveDoc(documentId, d1)
 
-    const gate = deferred()
+    const gate = Promise.withResolvers<void>()
     adapter.gates.remove = gate.promise
     const compaction = storage.saveDoc(
       documentId,
@@ -649,7 +680,7 @@ describe("StorageSubsystem removal in flight", () => {
     )
     await storage.removeDoc(documentId)
     await storage.saveDoc(documentId, d1) // re-import
-    gate.release()
+    gate.resolve()
     await compaction
 
     adapter.gates.remove = undefined
@@ -664,28 +695,80 @@ describe("StorageSubsystem removal in flight", () => {
     const d1 = A.from({ foo: "bar" })
     await storage.saveDoc(documentId, d1)
 
-    const gate = deferred()
+    const gate = Promise.withResolvers<void>()
     adapter.gates.remove = gate.promise
     const compaction = storage.saveDoc(
       documentId,
       A.change(d1, d => (d.foo = "baz"))
     )
-    await pause()
-    assert.equal(
-      adapter.removesStarted,
-      1,
-      "the old snapshot's remove() is held"
-    )
+    await adapter.removeStarted.promise // the old snapshot's remove() is held
 
     const removal = storage.removeDoc(documentId)
     const reimport = removal.then(() => storage.saveDoc(documentId, d1))
-    await pause() // a removal that doesn't wait lets the re-import land here
-    gate.release()
+    // Storage here settles in microtasks, so one macrotask is enough for a
+    // removal that doesn't wait to let the re-import land.
+    await pause()
+    gate.resolve()
     await Promise.all([compaction, removal, reimport])
 
     adapter.gates.remove = undefined
     await storage.saveDoc(documentId, d1)
     assert.ok(await new StorageSubsystem(adapter).loadDoc(documentId))
+  })
+
+  it("records no heads from a load that the removal overtook", async () => {
+    const adapter = new GatedStorageAdapter()
+    const storage = new StorageSubsystem(adapter)
+    const documentId = parseAutomergeUrl(generateAutomergeUrl()).documentId
+    const doc = A.from({ foo: "bar" })
+    await storage.saveDoc(documentId, doc)
+
+    const gate = Promise.withResolvers<void>()
+    adapter.gates.loadRange = gate.promise
+    const load = storage.loadDoc(documentId) // has read, has not returned
+    await storage.removeDoc(documentId)
+    storage.forget(documentId) // as the registry would
+    gate.resolve()
+    await load
+
+    adapter.gates.loadRange = undefined
+    await storage.saveDoc(documentId, doc) // re-import
+    const reloaded = await new StorageSubsystem(adapter).loadDoc(documentId)
+    assert.deepStrictEqual(reloaded, doc)
+  })
+
+  // forget() from the registry can drop removeDoc's heads floor while a
+  // compaction begun during the removal is still running.
+  it("records no heads from a compaction that the removal overtook", async () => {
+    const adapter = new GatedStorageAdapter()
+    const storage = new StorageSubsystem(adapter)
+    const documentId = parseAutomergeUrl(generateAutomergeUrl()).documentId
+    const d1 = A.from({ foo: "bar" })
+    await storage.saveDoc(documentId, d1)
+
+    const rangeGate = Promise.withResolvers<void>()
+    adapter.gates.removeRange = rangeGate.promise
+    const removal = storage.removeDoc(documentId)
+
+    const d2 = A.change(d1, d => (d.foo = "baz"))
+    await storage.saveDoc(documentId, d2)
+    const removeGate = Promise.withResolvers<void>()
+    adapter.gates.remove = removeGate.promise
+    const d3 = A.change(d2, d => (d.foo = "qux"))
+    const compaction = storage.saveDoc(documentId, d3)
+    await adapter.removeStarted.promise
+
+    rangeGate.resolve()
+    await removal
+    storage.forget(documentId) // as the registry would
+    removeGate.resolve()
+    await compaction
+
+    adapter.gates.remove = undefined
+    adapter.gates.removeRange = undefined
+    await storage.saveDoc(documentId, d3) // re-import
+    const reloaded = await new StorageSubsystem(adapter).loadDoc(documentId)
+    assert.deepStrictEqual(reloaded, d3)
   })
 })
 
